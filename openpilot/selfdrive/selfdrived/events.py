@@ -6,6 +6,8 @@ import os
 from enum import IntEnum
 from collections.abc import Callable
 
+from opendbc.car.hyundai.values import HyundaiFlags
+
 from openpilot.cereal import log, car
 import openpilot.cereal.messaging as messaging
 from openpilot.common.constants import CV
@@ -52,12 +54,18 @@ class ET:
 # get event name from enum
 EVENT_NAME = {v: k for k, v in EventName.schema.enumerants.items()}
 
+TEMP_STEER_EVENTS = (EventName.steerTempUnavailable, EventName.steerTempUnavailableSilent)
+TEMP_STEER_WARNING_DELAY_FRAMES = round(0.12 / DT_CTRL)
+TEMP_STEER_WARNING_RESET_FRAMES = round(1.0 / DT_CTRL)
+
 
 class Events:
   def __init__(self):
     self.events: list[int] = []
     self.static_events: list[int] = []
     self.event_counters = dict.fromkeys(EVENTS.keys(), 0)
+    self._steer_warning_fault_frames = 0
+    self._steer_warning_clear_frames = 0
 
   @property
   def names(self) -> list[int]:
@@ -72,6 +80,15 @@ class Events:
     bisect.insort(self.events, event_name)
 
   def clear(self) -> None:
+    # Count completed cycles, sharing history across audible/silent variants.
+    # Short healthy gaps must not hide repeated interruptions indefinitely.
+    if any(e in self.events for e in TEMP_STEER_EVENTS):
+      self._steer_warning_fault_frames = min(self._steer_warning_fault_frames + 1, TEMP_STEER_WARNING_DELAY_FRAMES)
+      self._steer_warning_clear_frames = 0
+    else:
+      self._steer_warning_clear_frames = min(self._steer_warning_clear_frames + 1, TEMP_STEER_WARNING_RESET_FRAMES)
+      if self._steer_warning_clear_frames >= TEMP_STEER_WARNING_RESET_FRAMES:
+        self._steer_warning_fault_frames = 0
     self.event_counters = {k: (v + 1 if k in self.events else 0) for k, v in self.event_counters.items()}
     self.events = self.static_events.copy()
 
@@ -90,6 +107,13 @@ class Events:
           alert = EVENTS[e][et]
           if not isinstance(alert, Alert):
             alert = alert(*callback_args)
+
+          # Presentation only: keep fault events, no-entry and the state-machine
+          # deadline immediate. Critical takeover alerts always bypass the delay.
+          if (e in TEMP_STEER_EVENTS and et in (ET.SOFT_DISABLE, ET.WARNING) and
+              alert.alert_status != AlertStatus.critical and
+              self._steer_warning_fault_frames < TEMP_STEER_WARNING_DELAY_FRAMES):
+            continue
 
           # Static alerts are shared objects in EVENTS. Translate a copy so the
           # canonical English text remains available when the language changes.
@@ -415,7 +439,15 @@ def invalid_lkas_setting_alert(CP: car.CarParams, CS: car.CarState, sm: messagin
   return NormalPermanentAlert("Invalid LKAS setting", text)
 
 def car_parser_result(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
-  results = Params().get("CanParserResult")
+  params = Params()
+  if (CP.brand == "hyundai" and not (CP.flags & HyundaiFlags.CAMERA_SCC)
+      and params.get_int("HyundaiCameraSCC") == 0 and params.get_bool("HyundaiCameraSccHint")):
+    return Alert(
+      "CAN Error: Enable CameraSCC",
+      "SCC detected on camera bus",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.)
+  results = params.get("CanParserResult")
   if results is None:
     results = ""
   return Alert(
@@ -545,6 +577,26 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "",
       AlertStatus.userPrompt, AlertSize.small,
       Priority.LOW, VisualAlert.steerRequired, AudibleAlert.none, 1.8),
+  },
+
+  # Retain the schema event for historical logs, without a fallback banner.
+  EventName.driverMonitorFallback: {},
+
+  # The global UI renders the cancellable countdown, including over settings.
+  # Keep sound below critical driving alerts and honor normal user volume.
+  EventName.impactDetected: {
+    ET.PERMANENT: Alert("", "", AlertStatus.normal, AlertSize.none, Priority.LOW,
+                        VisualAlert.none, AudibleAlert.prompt, 0.2),
+  },
+  EventName.impactDashcamReboot: {
+    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("Rebooting into Dashcam Mode"),
+    ET.NO_ENTRY: NoEntryAlert("Dashcam Mode"),
+    ET.PERMANENT: NormalPermanentAlert("Rebooting into Dashcam Mode", priority=Priority.LOW),
+  },
+
+  EventName.systemReady: {
+    ET.PERMANENT: Alert("", "", AlertStatus.normal, AlertSize.none, Priority.LOWEST,
+                        VisualAlert.none, AudibleAlert.systemReady, 0.2),
   },
 
   EventName.driverDistracted1: {
@@ -1088,6 +1140,12 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   EventName.radarCutin: {
      ET.WARNING: EngagementAlert(AudibleAlert.radarCutin),
   },
+  EventName.radarStationaryLead: {
+    ET.WARNING: Alert(
+      "전방 물체 주의", "전방을 확인하고 감속을 준비하세요",
+      AlertStatus.normal, AlertSize.mid,
+      Priority.HIGH, VisualAlert.none, AudibleAlert.prompt, 2.),
+  },
   EventName.audioRefuse: {
      ET.WARNING: EngagementAlert(AudibleAlert.refuse),
   },
@@ -1165,6 +1223,13 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
   EventName.torqueNNLoad: {
     ET.PERMANENT: torque_nn_load_alert,
+  },
+  EventName.updateRebootRequired: {
+    ET.PERMANENT: Alert(
+      "Reboot to Apply Update",
+      "Park safely before rebooting your device",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.LOW, VisualAlert.none, AudibleAlert.prompt, 8.0),
   },
 
 }

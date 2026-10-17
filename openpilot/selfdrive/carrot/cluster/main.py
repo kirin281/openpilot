@@ -20,14 +20,11 @@ from cluster_config import (
     CLUSTER_ENCODER_PARAM,
     CLUSTER_ENCODER_SOFTWARE,
     CLUSTER_HUD_MIRROR_PARAM,
-    CLUSTER_CORE_MODE_PARAM,
     CLUSTER_HUD_DEBUG_PARAM,
     CLUSTER_HUD_PARAM,
-    CLUSTER_LIVE_FPS_PARAM,
     CLUSTER_ORIENTATION_PARAM,
     CLUSTER_PANEL_LAYOUT_DRIVING_LEFT,
     CLUSTER_PANEL_LAYOUT_PARAM,
-    CLUSTER_PRIORITY_PARAM,
     CLUSTER_RADAR_DISPLAY_PARAM,
     CLUSTER_RADAR_INFO_PARAM,
     CLUSTER_RADAR_SOURCE_COLOR_PARAM,
@@ -43,11 +40,8 @@ from cluster_config import (
     normalize_cluster_brightness_percent,
     cluster_camera_view_is_road_camera,
     normalize_cluster_camera_view_mode,
-    normalize_cluster_core_mode,
     normalize_cluster_encoder_mode,
-    normalize_cluster_live_fps,
     normalize_cluster_panel_layout,
-    normalize_cluster_priority,
     normalize_cluster_radar_display_mode,
     normalize_cluster_radar_info_mode,
     normalize_cluster_radar_source_color_mode,
@@ -74,7 +68,7 @@ from cluster_h264_pipeline import (
 from cluster_live import OpenpilotLiveSource
 from cluster_models import RouteOverlay, SimulatorInput
 from cluster_navi_overlay import merge_navi_overlay_state
-from cluster_profile import GcProfileHook, ProfileReporter, freeze_gc_after_init
+from cluster_profile import GcProfileHook, ProfileReporter, freeze_gc_after_init, restore_gc_after_run
 from cluster_renderer import ClusterUiRenderer
 from cluster_route_replay import (
     ROUTE_CORNER_SOURCE_CHOICES,
@@ -85,8 +79,11 @@ from cluster_route_replay import (
 )
 from cluster_simulator import ClusterSimulator, RandomInputSource
 from cluster_system_monitor import ClusterProcessCoreUsageSampler, NetworkAddressProvider
-from cluster_usb_display import TuringUsbDisplay, find_supported_usb_product, product_id_for_hud_mode
+from cluster_usb_display import TuringUsbDisplay, find_supported_usb_product, product_id_for_hud_mode, _set_cluster_hud_connected
 from cluster_usb_pipeline import AsyncJpegUsbPipeline
+from cluster_wifi_display import create_display
+from cluster_wifi_protocol import load_config as load_wifi_config, select_codec as select_wifi_codec
+from openpilot.common.display_scheduling import DisplayScheduler
 from openpilot.selfdrive.controls.lib.cutin_alert import CutinAlertCandidate, CutinAlertTracker
 
 DEFAULT_FPS = 0.0
@@ -291,8 +288,10 @@ class ClusterClockVisibilityParamReader:
             return True
 
 
-class ClusterLiveFpsParamReader:
-    def __init__(self) -> None:
+class ClusterUsbFpsReader:
+    def __init__(self, normal_fps: float = 10.0, *, egpu_max_fps: float = 5.0) -> None:
+        self.normal_fps = normal_fps
+        self.egpu_max_fps = egpu_max_fps
         self._params = None
         try:
             from openpilot.common.params import Params
@@ -303,11 +302,11 @@ class ClusterLiveFpsParamReader:
 
     def read(self) -> float:
         if self._params is None:
-            return 0.0
+            return self.normal_fps
         try:
-            return normalize_cluster_live_fps(self._params.get_int(CLUSTER_LIVE_FPS_PARAM))
+            return min(self.egpu_max_fps, self.normal_fps) if self._params.get_bool("UsbGpuActive") else self.normal_fps
         except Exception:
-            return 0.0
+            return self.normal_fps
 
 
 class ClusterHudBrightnessParamReader:
@@ -561,44 +560,6 @@ class ClusterHudEncoderParamReader:
             return None
 
 
-class ClusterHudCoreModeParamReader:
-    def __init__(self) -> None:
-        self._params = None
-        try:
-            from openpilot.common.params import Params
-
-            self._params = Params()
-        except Exception:
-            pass
-
-    def read(self) -> int | None:
-        if self._params is None:
-            return None
-        try:
-            return normalize_cluster_core_mode(self._params.get_int(CLUSTER_CORE_MODE_PARAM))
-        except Exception:
-            return None
-
-
-class ClusterHudPriorityParamReader:
-    def __init__(self) -> None:
-        self._params = None
-        try:
-            from openpilot.common.params import Params
-
-            self._params = Params()
-        except Exception:
-            pass
-
-    def read(self) -> int | None:
-        if self._params is None:
-            return None
-        try:
-            return normalize_cluster_priority(self._params.get_int(CLUSTER_PRIORITY_PARAM))
-        except Exception:
-            return None
-
-
 def route_overlay_for_mode(
     overlay: RouteOverlay | None,
     mode: str,
@@ -653,7 +614,7 @@ def align_dimension(value: int, alignment: int) -> int:
 def run_demo(
     duration_seconds: float | None,
     target_fps: float,
-    live_fps_param_reader: ClusterLiveFpsParamReader | None,
+    usb_fps_reader: ClusterUsbFpsReader | None,
     input_mode: str,
     navi_host: str,
     navi_port: int,
@@ -727,15 +688,11 @@ def run_demo(
     screen_mode: str | None,
     hud_mode_watch: int | None,
     hud_encoder_watch: int | None,
-    hud_core_mode_watch: int | None,
-    hud_priority_watch: int | None,
     language: str | None,
     is_metric: bool | None,
 ) -> None:
-    if hud_core_mode_watch is not None:
-        hud_core_mode_watch = normalize_cluster_core_mode(hud_core_mode_watch)
-    if hud_priority_watch is not None:
-        hud_priority_watch = normalize_cluster_priority(hud_priority_watch)
+    scheduler = DisplayScheduler(4, enabled=TICI)
+    scheduler.update(False, force=True)
     profile = ProfileReporter(profile_render, profile_interval_s)
     gc_hook = GcProfileHook(profile) if profile_render else None
     if gc_hook is not None:
@@ -772,7 +729,7 @@ def run_demo(
         auto_enabled=usb_brightness_auto_enabled,
     )
     if output_mode in ("usb", "both"):
-        usb_display = TuringUsbDisplay(
+        usb_display = create_display(
             brightness=initial_usb_brightness,
             display_fps=usb_display_fps,
             jpeg_quality=usb_jpeg_quality,
@@ -791,18 +748,16 @@ def run_demo(
         # mandatory sync transaction immediately after USB initialization.
         usb_display.set_orientation(active_orientation)
         usb_display.set_profile_enabled(profile_render)
-        profile_stage = time.perf_counter()
-        try:
-            usb_display.open()
-        except Exception:
-            usb_display.close()
-            raise
-        profile.add_elapsed("usb.open", profile_stage)
-        profile.add_samples(usb_display.profile_samples())
-        usb_display.clear_profile_samples()
-        if usb_async and usb_codec == "jpeg":
-            usb_pipeline = AsyncJpegUsbPipeline(usb_display)
-            usb_pipeline.start()
+        if not getattr(usb_display, "open_after_renderer", False):
+            profile_stage = time.perf_counter()
+            try:
+                usb_display.open()
+            except Exception:
+                usb_display.close()
+                raise
+            profile.add_elapsed("usb.open", profile_stage)
+            profile.add_samples(usb_display.profile_samples())
+            usb_display.clear_profile_samples()
 
     frame_width = width or (usb_display.landscape_width if usb_display is not None else DESIGN_WIDTH)
     frame_height = height or (usb_display.landscape_height if usb_display is not None else DESIGN_HEIGHT)
@@ -890,8 +845,6 @@ def run_demo(
     active_radar_source_color_mode = radar_source_color_param_reader.read()
     hud_mode_param_reader = ClusterHudModeParamReader() if hud_mode_watch is not None else None
     hud_encoder_param_reader = ClusterHudEncoderParamReader() if hud_encoder_watch is not None else None
-    hud_core_mode_param_reader = ClusterHudCoreModeParamReader() if hud_core_mode_watch is not None else None
-    hud_priority_param_reader = ClusterHudPriorityParamReader() if hud_priority_watch is not None else None
     hud_debug_param_reader = ClusterHudOutputGateParamReader() if hud_mode_watch is not None or input_mode == "live" else None
     hud_output_gate_param_reader = hud_debug_param_reader if hud_mode_watch is not None else None
     active_hud_debug_mode = hud_debug_param_reader.read_mode() if hud_debug_param_reader is not None else 0
@@ -1067,6 +1020,7 @@ def run_demo(
         )
         return True
 
+    previous_gc_thresholds = None
     try:
         if hud_output_gate_param_reader is not None and not hud_output_gate_param_reader.allowed():
             print(
@@ -1083,6 +1037,16 @@ def run_demo(
         renderer.open(hidden=output_mode == "usb")
         profile.add_samples(renderer.profile_samples())
         renderer.clear_profile_samples()
+        if usb_display is not None:
+            if getattr(usb_display, "open_after_renderer", False):
+                profile_stage = time.perf_counter()
+                usb_display.open()
+                profile.add_elapsed("usb.open", profile_stage)
+                profile.add_samples(usb_display.profile_samples())
+                usb_display.clear_profile_samples()
+            if usb_async and usb_codec == "jpeg":
+                usb_pipeline = AsyncJpegUsbPipeline(usb_display)
+                usb_pipeline.start()
         if usb_display is not None and usb_codec == "h264":
             h264_encoder_fps = resolved_h264_encoder_fps(target_fps, usb_h264_fps)
             h264_pipeline = H264UsbPipeline(
@@ -1167,7 +1131,7 @@ def run_demo(
                     flush=True,
                 )
         if gc_freeze_init:
-            freeze_gc_after_init(profile)
+            previous_gc_thresholds = freeze_gc_after_init(profile)
         while True:
             if stop_requested:
                 break
@@ -1310,8 +1274,6 @@ def run_demo(
                 and (
                     hud_mode_param_reader is not None
                     or hud_encoder_param_reader is not None
-                    or hud_core_mode_param_reader is not None
-                    or hud_priority_param_reader is not None
                     or hud_debug_param_reader is not None
                 )
             ):
@@ -1329,22 +1291,6 @@ def run_demo(
                         flush=True,
                     )
                     break
-                next_hud_core_mode = hud_core_mode_param_reader.read() if hud_core_mode_param_reader is not None else None
-                if next_hud_core_mode is not None and next_hud_core_mode != hud_core_mode_watch:
-                    print(
-                        f"{CLUSTER_CORE_MODE_PARAM} changed from "
-                        f"{hud_core_mode_watch} to {next_hud_core_mode}; exiting for restart",
-                        flush=True,
-                    )
-                    break
-                next_hud_priority = hud_priority_param_reader.read() if hud_priority_param_reader is not None else None
-                if next_hud_priority is not None and next_hud_priority != hud_priority_watch:
-                    print(
-                        f"{CLUSTER_PRIORITY_PARAM} changed from "
-                        f"{hud_priority_watch} to {next_hud_priority}; exiting for restart",
-                        flush=True,
-                    )
-                    break
                 if hud_debug_param_reader is not None:
                     next_hud_debug_mode = hud_debug_param_reader.read_mode()
                     if next_hud_debug_mode != active_hud_debug_mode:
@@ -1357,13 +1303,13 @@ def run_demo(
                         if live_source is not None:
                             live_source.set_hud_debug_mode(active_hud_debug_mode)
                 next_hud_mode_param_read = now + HUD_MODE_PARAM_POLL_SECONDS
-            if live_fps_param_reader is not None and now >= next_fps_param_read:
-                next_target_fps = live_fps_param_reader.read()
+            if usb_fps_reader is not None and now >= next_fps_param_read:
+                next_target_fps = usb_fps_reader.read()
                 if next_target_fps != target_fps:
                     next_h264_encoder_fps = resolved_h264_encoder_fps(next_target_fps, usb_h264_fps)
                     if h264_pipeline is not None and next_h264_encoder_fps != h264_pipeline.fps:
                         print(
-                            f"{CLUSTER_LIVE_FPS_PARAM} changed H264 encoder FPS "
+                            f"USB display FPS changed H264 encoder FPS "
                             f"from {h264_pipeline.fps} to {next_h264_encoder_fps}; exiting for restart",
                             flush=True,
                         )
@@ -1372,14 +1318,9 @@ def run_demo(
                     frame_interval = 1.0 / target_fps if target_fps > 0 else 0.0
                     renderer.set_target_fps(max(0, int(round(target_fps))))
                     fps_text = "uncapped" if target_fps == 0 else f"{target_fps:.1f} Hz"
-                    print(f"{CLUSTER_LIVE_FPS_PARAM} updated: {fps_text}", flush=True)
+                    print(f"USB display FPS updated: {fps_text}", flush=True)
                     if usb_display is not None and usb_display_fps_auto:
-                        next_display_fps = resolved_usb_display_fps(
-                            None,
-                            usb_codec,
-                            target_fps,
-                            usb_h264_fps,
-                        )
+                        next_display_fps = int(target_fps)
                         if usb_display.set_display_fps(next_display_fps):
                             print(f"TURZX display FPS updated: {next_display_fps}", flush=True)
                 next_fps_param_read = now + FPS_PARAM_POLL_SECONDS
@@ -1400,6 +1341,10 @@ def run_demo(
             if live_source is not None:
                 profile_stage = time.perf_counter()
                 state = live_source.update()
+                scheduler.update(
+                    live_source.onroad_state() is True,
+                    child_pid=h264_pipeline.encoder_pid if h264_pipeline is not None else None,
+                )
                 if (
                     hud_output_gate_param_reader is not None
                     and live_source.onroad_state() is False
@@ -1965,34 +1910,45 @@ def run_demo(
                 report_frames = 0
                 last_report_time = now
     finally:
-        if signal_installed:
-            signal.signal(signal.SIGTERM, previous_sigterm_handler)
-        if gc_hook is not None:
+        try:
+            # Restore even if a later native-resource close raises an exception.
+            restore_gc_after_run(previous_gc_thresholds)
+            if usb_display is not None:
+                _set_cluster_hud_connected(False)
+            scheduler.update(False, force=True, child_pid=h264_pipeline.encoder_pid if h264_pipeline is not None else None)
+            if signal_installed:
+                signal.signal(signal.SIGTERM, previous_sigterm_handler)
+            if gc_hook is not None:
+                try:
+                    gc.callbacks.remove(gc_hook)
+                except ValueError:
+                    pass
+            network_address_provider.close()
+            if cluster_core_usage_sampler is not None:
+                cluster_core_usage_sampler.close()
+            renderer.release_nv12_dmabuf_output()
+            if h264_pipeline is not None:
+                h264_pipeline.close()
+            if usb_pipeline is not None:
+                usb_pipeline.close()
+            if controller is not None:
+                controller.close()
+            if route_tools_window is not None:
+                route_tools_window.close()
+            if route_source is not None:
+                route_source.close()
+            if live_source is not None:
+                live_source.close()
+            if navi_source is not None:
+                navi_source.close()
+        finally:
+            # A transport close may wait or receive the manager's SIGINT. Release
+            # graphics first, even if an earlier cleanup step was interrupted.
             try:
-                gc.callbacks.remove(gc_hook)
-            except ValueError:
-                pass
-        network_address_provider.close()
-        if cluster_core_usage_sampler is not None:
-            cluster_core_usage_sampler.close()
-        renderer.release_nv12_dmabuf_output()
-        if h264_pipeline is not None:
-            h264_pipeline.close()
-        if usb_pipeline is not None:
-            usb_pipeline.close()
-        if controller is not None:
-            controller.close()
-        if route_tools_window is not None:
-            route_tools_window.close()
-        if route_source is not None:
-            route_source.close()
-        if live_source is not None:
-            live_source.close()
-        if navi_source is not None:
-            navi_source.close()
-        if usb_display is not None:
-            usb_display.close()
-        renderer.close()
+                renderer.close()
+            finally:
+                if usb_display is not None:
+                    usb_display.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -2003,7 +1959,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Target refresh rate. Use 0 for uncapped/as-fast-as-possible. "
-            f"When omitted, CLI runs read {CLUSTER_LIVE_FPS_PARAM}; mode 0 keeps the default cap behavior."
+            "Live USB output on devices is fixed at 10 FPS, or 5 FPS with eGPU."
         ),
     )
     parser.add_argument(
@@ -2388,18 +2344,6 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
-        "--cluster-hud-core-mode",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--cluster-hud-priority",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
         "--route-loop",
         action="store_true",
         help="Loop route replay instead of stopping at the end.",
@@ -2553,38 +2497,18 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main(*, exit_on_error: bool = True) -> None:
-    args = parse_args()
-    if args.output in ("usb", "both") and not TICI:
-        expected_product_id = product_id_for_hud_mode(args.cluster_hud_mode) if args.cluster_hud_mode is not None else None
-        if find_supported_usb_product(expected_product_id) is None:
-            print(
-                "TURZX USB cluster display not found on PC; rendering to window only.",
-                flush=True,
-            )
-            args.output = "window"
-    encoder_source = apply_cluster_encoder_param(args)
-    if args.usb_async and args.usb_codec != "jpeg":
-        raise SystemExit("--usb-async only supports --usb-codec jpeg")
+def resolve_usb_output_rate(args: argparse.Namespace):
     target_fps = args.fps
     fps_source = "--fps" if args.fps_from_cli else "default"
-    live_fps_param_reader = None
-    if not args.fps_from_cli:
-        fps_param_reader = ClusterLiveFpsParamReader()
-        param_fps = fps_param_reader.read()
-        if args.input == "live" or param_fps > 0:
-            live_fps_param_reader = fps_param_reader
-            target_fps = param_fps
-            fps_source = CLUSTER_LIVE_FPS_PARAM
-    if (
-        args.output in ("usb", "both")
-        and args.usb_codec == "h264"
-        and not args.fps_from_cli
-        and live_fps_param_reader is None
-    ):
+    usb_fps_reader = None
+    usb_output_enabled = args.output in ("usb", "both")
+    if TICI and args.input == "live" and usb_output_enabled:
+        usb_fps_reader = ClusterUsbFpsReader()
+        target_fps = usb_fps_reader.read()
+        fps_source = "fixed USB policy"
+    elif usb_output_enabled and args.usb_codec == "h264" and not args.fps_from_cli:
         target_fps = float(args.usb_h264_fps)
         fps_source = "--usb-h264-fps"
-    usb_output_enabled = args.output in ("usb", "both")
     usb_display_fps = (
         resolved_usb_display_fps(
             args.usb_display_fps,
@@ -2595,7 +2519,51 @@ def main(*, exit_on_error: bool = True) -> None:
         if usb_output_enabled
         else 0
     )
-    usb_display_fps_auto = usb_output_enabled and args.usb_display_fps is None and args.usb_codec == "h264"
+    if usb_fps_reader is not None:
+        usb_display_fps = int(target_fps)
+    usb_display_fps_auto = usb_fps_reader is not None or (usb_output_enabled and args.usb_display_fps is None and args.usb_codec == "h264")
+    return target_fps, fps_source, usb_fps_reader, usb_display_fps, usb_display_fps_auto
+
+
+def main(*, exit_on_error: bool = True) -> None:
+    args = parse_args()
+    wifi_config = load_wifi_config() if args.output in ("usb", "both") else None
+    if args.output in ("usb", "both") and not TICI and wifi_config is None:
+        expected_product_id = product_id_for_hud_mode(args.cluster_hud_mode) if args.cluster_hud_mode is not None else None
+        if find_supported_usb_product(expected_product_id) is None:
+            print(
+                "TURZX USB cluster display not found on PC; rendering to window only.",
+                flush=True,
+            )
+            args.output = "window"
+    encoder_source = apply_cluster_encoder_param(args)
+    if wifi_config is not None:
+        jpeg_fallback = (args.usb_codec_from_cli and args.usb_codec == "jpeg" and
+                         args.cluster_hud_encoder == CLUSTER_ENCODER_AUTO)
+        args.usb_codec = select_wifi_codec(wifi_config, jpeg_fallback=jpeg_fallback)
+        args.usb_jpeg_quality = int(wifi_config.get("quality", 50))
+        args.usb_async = args.usb_codec == "jpeg"
+        encoder_source = f"S3 Wi-Fi {args.usb_codec.upper()}"
+        if args.usb_codec == "h264":
+            if args.usb_h264_bitrate == "auto":
+                args.usb_h264_bitrate = "1M"
+            args.usb_h264_gop = 10
+            args.usb_h264_wait_ack = False
+            args.usb_h264_soft_ack = False
+            if args.usb_h264_diagnose_interval == 0:
+                args.usb_h264_diagnose_interval = 10.0
+    if args.usb_async and args.usb_codec != "jpeg":
+        raise SystemExit("--usb-async only supports --usb-codec jpeg")
+    target_fps, fps_source, usb_fps_reader, usb_display_fps, usb_display_fps_auto = resolve_usb_output_rate(args)
+    if wifi_config is not None:
+        target_fps = float(wifi_config.get("fps", 15))
+        fps_source = "S3 Wi-Fi"
+        # S3 sends over Wi-Fi rather than sharing C4's USB link with the eGPU.
+        usb_fps_reader = ClusterUsbFpsReader(target_fps, egpu_max_fps=10.0) if TICI and args.input == "live" else None
+        if usb_fps_reader is not None:
+            target_fps = usb_fps_reader.read()
+        usb_display_fps = int(target_fps)
+        usb_display_fps_auto = usb_fps_reader is not None
     usb_h264_bitrate = resolved_usb_h264_bitrate(args.usb_h264_bitrate, target_fps, args.usb_h264_fps)
     usb_h264_bitrate_auto = args.usb_h264_bitrate.strip().lower() == "auto"
     brightness_param_reader = None
@@ -2640,7 +2608,7 @@ def main(*, exit_on_error: bool = True) -> None:
         run_demo(
             args.duration,
             target_fps,
-            live_fps_param_reader,
+            usb_fps_reader,
             args.input,
             args.navi_host,
             args.navi_port,
@@ -2714,8 +2682,6 @@ def main(*, exit_on_error: bool = True) -> None:
             args.screen_mode,
             args.cluster_hud_mode,
             args.cluster_hud_encoder,
-            args.cluster_hud_core_mode,
-            args.cluster_hud_priority,
             args.language,
             args.is_metric,
         )
